@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the work email digest every morning at 07:00
+
+[Timer]
+OnCalendar=*-*-* 07:00:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

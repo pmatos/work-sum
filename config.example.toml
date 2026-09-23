@@ -1,0 +1,26 @@
+# work-sum / mail-digest configuration.
+# Copy to ~/.config/mail-digest/config.toml and edit. Passwords never go here
+# (see README "Credentials").
+#
+# Folder names must match your IMAP names exactly. List them with:
+#   mail_digest.py --list-folders
+
+folders = [
+    "INBOX",
+    # "team.example",
+    # "lists.announce",
+]
+
+# Optional: local Ollama model.
+# model = "gemma4:26b-a4b-it-q4_K_M"
+
+# Optional: how far back to pull thread history for recaps (headers only).
+# thread_lookback_days = 60
+
+# Email delivery (used with --send).
+[delivery]
+smtp_host = "mail.example.com"
+smtp_port = 465
+smtp_user = "jdoe"
+mail_from = "jdoe@example.com"
+mail_to   = "me@example.org"

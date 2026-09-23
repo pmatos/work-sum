@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily work email digest (local Gemma summary of yesterday's mail)
+After=ollama.service
+Wants=ollama.service
+
+[Service]
+Type=oneshot
+# Reads folders/delivery from ~/.config/mail-digest/config.toml.
+# Decrypts imap-password.cred / smtp-password.cred via systemd-creds --user.
+ExecStart=%h/.local/bin/mail_digest.py --day yesterday --send
+TimeoutStartSec=600
