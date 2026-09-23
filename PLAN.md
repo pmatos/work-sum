@@ -1,5 +1,7 @@
 # Improvement plan
 
+**Status:** sections 1–5 were implemented in `391616c`. The "Later" items are still open.
+
 Findings come from a review of the first version (`bf5c24b`). Some were reproduced
 against a real day of mail, and the rest come from reading the code.
 
