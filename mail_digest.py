@@ -1,75 +1,52 @@
 #!/usr/bin/env python3
-"""Summarize yesterday's work email (read-only IMAP) with a local Ollama model,
+"""work-sum: summarize a day's work email (read-only IMAP) with a local Ollama model,
 grouping messages into threads.
 
 - New thread (started on the digest day): one summary of the whole thread.
-- Existing thread (has prior history): a short recap + what each new message adds.
+- Ongoing thread: a short recap of earlier messages + what the day's messages add.
 
 Read-only: uses EXAMINE + BODY.PEEK, never alters flags or messages.
-Password: systemd credential, then ~/.config/mail-digest/imap-password (0600), then keyring.
-Folders + options: ~/.config/mail-digest/config.toml
+Config: ~/.config/mail-digest/config.toml (see config.example.toml).
 """
-import argparse, email, html, imaplib, json, os, re, smtplib, subprocess, sys, time, urllib.request
-from email.message import EmailMessage
-from datetime import datetime, timedelta
+import argparse, email, html, imaplib, json, os, re, smtplib, subprocess, sys, time, traceback, urllib.request
+from datetime import date, datetime, timedelta
 from email.header import decode_header, make_header
+from email.message import EmailMessage
+from email.utils import getaddresses, parseaddr
 
-HOST = "mail.igalia.com"
-PORT = 993
-USER = "pmatos"
 OLLAMA = "http://127.0.0.1:11434/api/chat"
-MODEL = "gemma4:26b-a4b-it-q4_K_M"
-MAXCHARS = 3000          # per-message body sent to the model
-THREAD_LOOKBACK = 60     # days of header history for thread context
-RECAP_PRIOR_MAX = 6      # prior messages fed into a recap
-PRIORITY = {"ACTION": 2, "FYI": 1, "AUTO": 0}
+DEFAULT_MODEL = "gemma4:26b-a4b-it-q4_K_M"
+MAXCHARS = 3000          # per-message body cap
+NEW_BUDGET = 8000        # chars of the day's messages per thread sent to the model
+PRIOR_BUDGET = 5000      # chars of earlier messages used for the recap
+RECAP_PRIOR_MAX = 6      # earlier messages fetched for the recap
+CATCHUP_MAX_DAYS = 7
+CATS = ("ACTION", "FYI", "AUTO", "JUNK")
+PRIORITY = {"ACTION": 3, "FYI": 2, "AUTO": 1, "JUNK": 0}
 
 CONFIG_DIR = os.path.expanduser("~/.config/mail-digest")
 CONFIG_FILE = os.path.expanduser(os.environ.get("MAIL_DIGEST_CONFIG",
-                                                 "~/.config/mail-digest/config.toml"))
-RE_PREFIX = re.compile(r"^\s*((re|fwd|fw|aw|sv)\s*:\s*)+", re.I)
+                                                 os.path.join(CONFIG_DIR, "config.toml")))
+STATE_FILE = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+                          "mail-digest", "last-sent")
+
+RE_PREFIX = re.compile(r"^\s*((re|fwd|fw|aw|sv|rv|enc)\s*:\s*)+", re.I)
 UIDRE = re.compile(rb"UID (\d+)")
 IDATE = re.compile(rb'INTERNALDATE "([^"]+)"')
 MIDRE = re.compile(r"<[^>]+>")
+HDR_FIELDS = ("MESSAGE-ID IN-REPLY-TO REFERENCES SUBJECT FROM TO CC LIST-ID "
+              "AUTO-SUBMITTED PRECEDENCE X-SPAM-FLAG X-SPAM-STATUS X-SPAM-REPORT")
 
 
-# ---------- credentials / config ----------
-def get_secret(name):
-    """Fetch a secret by name from, in order: systemd credential, 0600 file,
-    user systemd-creds .cred, keyring (imap only)."""
-    cred = os.environ.get("CREDENTIALS_DIRECTORY")
-    if cred and os.path.exists(os.path.join(cred, name)):
-        return open(os.path.join(cred, name)).read().strip()
-    plain = os.path.join(CONFIG_DIR, name)
-    if os.path.exists(plain):
-        return open(plain).read().strip()
-    enc = plain + ".cred"
-    if os.path.exists(enc):
-        try:
-            return subprocess.check_output(
-                ["systemd-creds", "--user", "decrypt", "--name", name, enc, "-"],
-                stderr=subprocess.DEVNULL).decode().strip()
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            pass
-    if name == "imap-password":
-        try:
-            return subprocess.check_output(
-                ["secret-tool", "lookup", "service", "imap", "host", HOST, "user", USER],
-                stderr=subprocess.DEVNULL).decode().strip()
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            pass
-    return None
+def log(msg):
+    print(f"  · {msg}", file=sys.stderr)
 
 
-def get_password():
-    pw = get_secret("imap-password")
-    if not pw:
-        sys.exit("No IMAP password found. Create it with:\n"
-                 "  ( umask 177; systemd-ask-password 'Igalia IMAP password:' "
-                 "> ~/.config/mail-digest/imap-password )")
-    return pw
+class DeliveryError(Exception):
+    pass
 
 
+# ---------- config / credentials ----------
 def load_config():
     if not os.path.exists(CONFIG_FILE):
         return {}
@@ -81,19 +58,79 @@ def load_config():
         sys.exit(f"Error reading config {CONFIG_FILE}: {e}")
 
 
-def connect():
-    last = None
-    for attempt in range(5):                 # 7am: network may still be warming up
+class Settings:
+    def __init__(self, cfg):
+        acct = cfg.get("account", {})
+        self.host, self.user = acct.get("imap_host"), acct.get("imap_user")
+        if not self.host or not self.user:
+            sys.exit(f"config [account] needs imap_host and imap_user ({CONFIG_FILE})")
+        self.port = int(acct.get("imap_port", 993))
+        ident = cfg.get("identity", {})
+        self.name = ident.get("name") or self.user
+        self.role = ident.get("role", "")
+        self.me = {a.lower() for a in ident.get("addresses", [])}
+        self.model = cfg.get("model", DEFAULT_MODEL)
+        self.lookback = int(cfg.get("thread_lookback_days", 60))
+        self.folders = cfg.get("folders") or ["INBOX"]
+        self.delivery = cfg.get("delivery", {})
+
+
+def _read(path):
+    with open(path) as f:
+        return f.read().strip()
+
+
+def get_secret(name, s):
+    """Fetch a secret from, in order: systemd credential, 0600 file,
+    systemd-creds --user .cred, keyring (imap only)."""
+    cred = os.environ.get("CREDENTIALS_DIRECTORY")
+    if cred and os.path.exists(os.path.join(cred, name)):
+        return _read(os.path.join(cred, name))
+    plain = os.path.join(CONFIG_DIR, name)
+    if os.path.exists(plain):
+        if os.stat(plain).st_mode & 0o077:
+            log(f"warning: {plain} is readable by others; chmod 600 it")
+        return _read(plain)
+    enc = plain + ".cred"
+    if os.path.exists(enc):
         try:
-            M = imaplib.IMAP4_SSL(HOST, PORT, timeout=30)
-            M.login(USER, get_password())
-            return M
-        except (OSError, imaplib.IMAP4.error) as e:
-            last = e
-            time.sleep(5)
-    raise last
+            return subprocess.run(["systemd-creds", "--user", "decrypt", "--name", name, enc, "-"],
+                                  capture_output=True, check=True).stdout.decode().strip()
+        except FileNotFoundError:
+            log("warning: systemd-creds not found, cannot decrypt " + enc)
+        except subprocess.CalledProcessError as e:
+            log(f"warning: cannot decrypt {enc}: {e.stderr.decode(errors='replace').strip()}")
+    if name == "imap-password":
+        try:
+            return subprocess.check_output(
+                ["secret-tool", "lookup", "service", "imap", "host", s.host, "user", s.user],
+                stderr=subprocess.DEVNULL).decode().strip() or None
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+    return None
 
 
+def connect(s):
+    pw = get_secret("imap-password", s)
+    if not pw:
+        sys.exit("No IMAP password found. See README, section 'Credentials'.")
+    delay = 5
+    for attempt in range(5):             # network may still be warming up after resume
+        try:
+            M = imaplib.IMAP4_SSL(s.host, s.port, timeout=30)
+            break
+        except OSError as e:
+            if attempt == 4:
+                raise
+            log(f"IMAP connect failed ({e}); retrying in {delay}s")
+            time.sleep(delay)
+            delay *= 2
+    # Never retry a rejected login: repeated auth failures trip fail2ban.
+    M.login(s.user, pw)
+    return M
+
+
+# ---------- delivery ----------
 def md_to_html(md):
     def inline(t):
         t = html.escape(t)
@@ -102,22 +139,22 @@ def md_to_html(md):
         return t
     out, inlist = ['<div style="font-family:system-ui,sans-serif;max-width:720px;line-height:1.5">'], False
     for line in md.splitlines():
+        if line.startswith("- "):
+            if not inlist:
+                out.append("<ul>")
+                inlist = True
+            out.append(f"<li>{inline(line[2:])}</li>")
+            continue
+        if inlist:
+            out.append("</ul>")
+            inlist = False
         if line.startswith("### "):
-            if inlist: out.append("</ul>"); inlist = False
-            out.append(f"<h3 style='margin:.8em 0 .2em'>{inline(line[4:])}</h3>")
+            out.append(f"<h3 style='margin:1em 0 .1em'>{inline(line[4:])}</h3>")
         elif line.startswith("## "):
-            if inlist: out.append("</ul>"); inlist = False
             out.append(f"<h2 style='border-bottom:1px solid #ddd;padding-bottom:.2em'>{inline(line[3:])}</h2>")
         elif line.startswith("# "):
-            if inlist: out.append("</ul>"); inlist = False
             out.append(f"<h1>{inline(line[2:])}</h1>")
-        elif line.startswith("- "):
-            if not inlist: out.append("<ul>"); inlist = True
-            out.append(f"<li>{inline(line[2:])}</li>")
-        elif not line.strip():
-            if inlist: out.append("</ul>"); inlist = False
-        else:
-            if inlist: out.append("</ul>"); inlist = False
+        elif line.strip():
             out.append(f"<p style='margin:.2em 0'>{inline(line)}</p>")
     if inlist:
         out.append("</ul>")
@@ -125,26 +162,26 @@ def md_to_html(md):
     return "\n".join(out)
 
 
-def send_email(cfg, subject, md_text):
-    d = cfg.get("delivery", {})
-    host, port = d.get("smtp_host", "mail.igalia.com"), int(d.get("smtp_port", 465))
-    mail_from = d.get("mail_from", f"{USER}@igalia.com")
-    mail_to = d.get("mail_to")
-    smtp_user = d.get("smtp_user", USER)
+def send_email(s, subject, md_text):
+    d = s.delivery
+    host, port = d.get("smtp_host", s.host), int(d.get("smtp_port", 465))
+    mail_to, mail_from = d.get("mail_to"), d.get("mail_from", s.user)
     if not mail_to:
         sys.exit("config [delivery].mail_to is required for --send")
-    pw = get_secret("smtp-password") or get_secret("imap-password")
+    # No fallback to the IMAP password: if they differ, a guaranteed 535 feeds fail2ban.
+    pw = get_secret("smtp-password", s)
     if not pw:
-        sys.exit("No SMTP password. Create it with:\n"
-                 "  ( umask 177; systemd-ask-password 'Igalia SMTP password:' "
-                 "> ~/.config/mail-digest/smtp-password )")
+        sys.exit("No SMTP password found. See README, section 'Credentials'.")
     msg = EmailMessage()
     msg["Subject"], msg["From"], msg["To"] = subject, mail_from, mail_to
     msg.set_content(md_text)
     msg.add_alternative(md_to_html(md_text), subtype="html")
-    with smtplib.SMTP_SSL(host, port, timeout=60) as s:
-        s.login(smtp_user, pw)
-        s.send_message(msg)
+    try:
+        with smtplib.SMTP_SSL(host, port, timeout=60) as smtp:
+            smtp.login(d.get("smtp_user", s.user), pw)
+            smtp.send_message(msg)
+    except (OSError, smtplib.SMTPException) as e:
+        raise DeliveryError(f"SMTP delivery to {mail_to} failed: {e}") from e
 
 
 # ---------- text helpers ----------
@@ -152,7 +189,7 @@ def dstr(s):
     try:
         s = str(make_header(decode_header(s))) if s else ""
     except Exception:
-        s = s or ""
+        s = str(s or "")
     s = "".join(ch if (ch.isprintable() or ch == " ") else " " for ch in s)
     return re.sub(r"\s+", " ", s).strip()
 
@@ -165,95 +202,185 @@ def display_name(frm):
     return dstr(re.sub(r"\s*<[^>]+>\s*", "", frm or "")).strip(' "') or frm
 
 
-def strip_html(t):
-    t = re.sub(r"(?is)<(script|style).*?</\1>", " ", t)
-    t = re.sub(r"(?s)<[^>]+>", " ", t)
-    return html.unescape(t)
+def addrs(values):
+    return [a.lower() for _, a in getaddresses([str(v) for v in values]) if a]
+
+
+def decode_part(part):
+    raw = part.get_payload(decode=True) or b""
+    try:
+        return raw.decode(part.get_content_charset() or "utf-8", "replace")
+    except LookupError:                  # unknown charset name, e.g. "unknown-8bit"
+        return raw.decode("utf-8", "replace")
+
+
+HTML_QUOTE = re.compile(r'(?is)<div[^>]+(?:class="gmail_quote|id="divRplyFwdMsg|id="appendonsend'
+                        r'|class="moz-cite-prefix)|-----Original Message-----')
+
+
+def html_to_text(t):
+    t = re.sub(r"(?is)<(script|style|head)\b.*?</\1>", " ", t[:300000])
+    m = HTML_QUOTE.search(t)
+    if m:
+        t = t[:m.start()]
+    prev = None
+    while prev != t:                     # drop blockquotes, innermost first
+        prev = t
+        t = re.sub(r"(?is)<blockquote\b(?:(?!<blockquote\b).)*?</blockquote>", " ", t)
+    t = re.sub(r"(?i)<br\s*/?>|</(?:p|div|li|tr|h[1-6])>", "\n", t)
+    t = html.unescape(re.sub(r"(?s)<[^>]+>", " ", t))
+    return "\n".join(re.sub(r"[ \t\xa0]+", " ", ln).strip() for ln in t.splitlines())
+
+
+# Reply attributions ("On … wrote:", "El … escribió:", …), possibly wrapped over two lines.
+ATTRIB_END = re.compile(r"(wrote|escribió|escribiu|escreveu|a écrit|schrieb|scrisse)\s*:\s*$", re.I)
+ATTRIB_START = re.compile(r"^(On|El|O|A|Em|Le|Am|Il)\s", re.I)
+ORIGINAL_SEP = re.compile(r"^-{2,}\s*(Original Message|Mensaje original|Mensagem original|"
+                          r"Message d'origine|Ursprüngliche Nachricht)\s*-{2,}$", re.I)
+HDR_FROM = re.compile(r"^(From|De|Von):\s", re.I)
+HDR_NEXT = re.compile(r"^(Sent|Date|Enviado|Fecha|Data|Gesendet|Envoyé|To|Para|Subject|Asunto):", re.I)
+
+
+def clean_text(text):
+    lines = text.splitlines()
+    out = []
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith(">"):
+            continue
+        if ORIGINAL_SEP.match(s) or s.startswith("________") or ln.rstrip() == "--":
+            break
+        # Outlook-style unquoted history: "From: …" followed by "Sent:/Date:/To:" lines.
+        if HDR_FROM.match(s) and any(x.strip() for x in out) \
+           and any(HDR_NEXT.match(x.strip()) for x in lines[i + 1:i + 4]) \
+           and not any("forward" in x.lower() or "reenviad" in x.lower() for x in lines[max(0, i - 2):i]):
+            break
+        if len(s) < 300 and ATTRIB_END.search(s):
+            if out and ATTRIB_START.match(out[-1].strip()) and not ATTRIB_END.search(out[-1]):
+                out.pop()
+            continue
+        out.append(ln)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
 
 def clean_body(msg):
-    text = ""
-    if msg.is_multipart():
-        for part in msg.walk():
-            if part.get_content_type() == "text/plain" and "attachment" not in str(part.get("Content-Disposition")):
-                text = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace")
-                break
-        if not text:
-            for part in msg.walk():
-                if part.get_content_type() == "text/html":
-                    raw = part.get_payload(decode=True).decode(part.get_content_charset() or "utf-8", "replace")
-                    text = strip_html(raw)
-                    break
-    else:
-        raw = msg.get_payload(decode=True)
-        text = raw.decode(msg.get_content_charset() or "utf-8", "replace") if raw else ""
-        if msg.get_content_type() == "text/html":
-            text = strip_html(text)
-    out = []
-    for ln in text.splitlines():
-        s = ln.strip()
-        if re.match(r"^On .*wrote:$", s) or s.startswith("-----Original Message-----") \
-           or s.startswith("________") or s == "-- ":
-            break
-        if s.startswith(">"):
+    plain = htmlp = None
+    for part in msg.walk():
+        if part.is_multipart() or "attachment" in str(part.get("Content-Disposition", "")).lower():
             continue
-        out.append(ln)
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()[:MAXCHARS]
+        ct = part.get_content_type()
+        if ct == "text/plain" and plain is None:
+            plain = decode_part(part)
+        elif ct == "text/html" and htmlp is None:
+            htmlp = decode_part(part)
+    text = clean_text(plain) if plain else ""
+    if not text and htmlp:
+        text = clean_text(html_to_text(htmlp))
+    return text[:MAXCHARS]
 
 
 # ---------- ollama ----------
-def ollama(prompt, num_predict):
-    data = json.dumps({"model": MODEL,
+def ollama(model, prompt, schema, num_predict=320):
+    data = json.dumps({"model": model,
                        "messages": [{"role": "user", "content": prompt}],
-                       "stream": False, "think": False,
+                       "stream": False, "think": False, "format": schema,
                        "options": {"temperature": 0.2, "num_predict": num_predict}}).encode()
     req = urllib.request.Request(OLLAMA, data=data, headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=600) as r:
-        return json.load(r)["message"]["content"].strip()
+        content = json.load(r)["message"]["content"].strip()
+    try:
+        out = json.loads(content)
+    except json.JSONDecodeError:
+        out = {"category": "FYI", "summary": content}
+    if out.get("category") not in CATS:
+        out["category"] = "FYI"
+    for k in ("summary", "recap"):
+        if k in out:
+            out[k] = " ".join(str(out[k]).split())
+    return out
 
 
-def parse_cat(out):
-    cat, _, summ = out.partition("|")
-    cat = (cat.strip().upper().split() or [""])[0]
-    if cat not in PRIORITY:
-        return ("FYI", out.strip())
-    return (cat, summ.strip() or "(no summary)")
+def delivery_hint(r):
+    bits = []
+    if r["from_me"]:
+        bits.append("sent by the reader")
+    elif r["to_me"]:
+        bits.append("sent directly to the reader")
+    elif r["cc_me"]:
+        bits.append("reader in Cc")
+    if r["list"]:
+        bits.append(f"via mailing list {r['list']}")
+    if r["auto"]:
+        bits.append("automated sender")
+    return ", ".join(bits) or "reader not addressed directly"
 
 
-CATS = "ACTION (pmatos must act/reply), FYI (informational), AUTO (automated notification, CI, mailing-list/vote bot, newsletter)"
+def render_msg(r, maxc):
+    who = "the reader" if r["from_me"] else r["from"]
+    when = r["date"].astimezone().strftime("%Y-%m-%d %H:%M") if r["date"] else "?"
+    return (f"From: {who}\nDate: {when}\nDelivery: {delivery_hint(r)}\n"
+            f"Subject: {r['subject']}\n\n{(r['body'] or '')[:maxc] or '(no text content)'}")
 
 
-def summ_new_thread(msgs):
-    convo = "\n\n----\n".join(
-        f"From: {m['from']}\nSubject: {m['subject']}\n\n{m['body'] or ''}" for m in msgs)[:6000]
-    p = (f"You triage a NEW work email thread (started today, {len(msgs)} message(s)) for a "
-         "busy compiler engineer (pmatos).\n"
-         "Reply EXACTLY one line: CATEGORY | 1-2 sentence summary of the whole thread and any "
-         "action pmatos must take (with deadlines).\n"
-         f"CATEGORY is one of: {CATS}.\n\n{convo}\n")
-    return parse_cat(ollama(p, 220))
+def fit(msgs, budget):
+    """Render messages within a char budget, keeping the newest when it runs out."""
+    if not msgs:
+        return ""
+    per = max(600, min(MAXCHARS, budget // len(msgs)))
+    parts, used = [], 0
+    for n, m in enumerate(reversed(msgs)):
+        block = render_msg(m, per)
+        if parts and used + len(block) > budget:
+            parts.append(f"[{len(msgs) - n} earlier message(s) omitted]")
+            break
+        parts.append(block)
+        used += len(block)
+    return "\n\n----\n".join(reversed(parts))
 
 
-def recap_prior(msgs):
-    ctx = "\n\n----\n".join(
-        f"From: {m['from']}\nSubject: {m['subject']}\n\n{m['body'] or ''}" for m in msgs)[:5000]
-    p = ("In 1-2 factual sentences, recap what this email thread has been about so far "
-         "(context prior to today). No preamble, no invented details.\n\n" + ctx)
-    return ollama(p, 130)
+def triage_intro(s):
+    role = f", {s.role}" if s.role else ""
+    return (f"You triage work email for {s.name}{role} (\"the reader\"). Categories:\n"
+            f"- ACTION: the reader personally needs to reply, review, decide or do something "
+            f"(direct questions or requests, deadlines that apply to them).\n"
+            f"- FYI: worth knowing, but no personal action.\n"
+            f"- AUTO: automated notifications (CI, GitLab, bots, calendars, service newsletters).\n"
+            f"- JUNK: spam, cold sales/marketing, unsolicited offers.\n"
+            f"Write plain, direct English. Lead with the point, name people and deadlines, and "
+            f"call the reader \"you\". Never write phrases like \"no action is required\" (the "
+            f"category says that) and don't start with \"This email\" or \"This thread\".\n\n")
 
 
-def summ_added(recap, m):
-    p = ("Ongoing email thread context: " + (recap or "(earlier messages not available)") +
-         "\n\nA new reply arrived today. Reply EXACTLY one line: CATEGORY | one sentence on what "
-         "this message adds or changes, plus any action for pmatos.\n"
-         f"CATEGORY is one of: {CATS}.\n\n"
-         f"From: {m['from']}\nSubject: {m['subject']}\n\n{m['body'] or ''}\n")
-    return parse_cat(ollama(p, 130))
+def summarize_thread(s, day, new_msgs, prior, ongoing):
+    cat = {"type": "string", "enum": list(CATS)}
+    if not ongoing:
+        schema = {"type": "object", "properties": {"category": cat, "summary": {"type": "string"}},
+                  "required": ["category", "summary"]}
+        p = (triage_intro(s) + f"A NEW thread started on {day} ({len(new_msgs)} message(s)). "
+             "Give its category and a 1-2 sentence summary of the whole thread, including "
+             "anything you must do.\n\n" + fit(new_msgs, NEW_BUDGET))
+    elif prior:
+        schema = {"type": "object", "properties": {"category": cat, "recap": {"type": "string"},
+                                                   "summary": {"type": "string"}},
+                  "required": ["category", "recap", "summary"]}
+        p = (triage_intro(s) + f"An ongoing thread got {len(new_msgs)} new message(s) on {day}. "
+             "Give: category (of the new messages); recap = one sentence on what the thread was "
+             f"about before {day}; summary = 1-2 sentences on what the new messages add or change "
+             "(who said what, if it matters).\n\n"
+             f"=== EARLIER MESSAGES ===\n{fit(prior, PRIOR_BUDGET)}\n\n"
+             f"=== NEW ON {day} ===\n{fit(new_msgs, NEW_BUDGET)}")
+    else:
+        schema = {"type": "object", "properties": {"category": cat, "summary": {"type": "string"}},
+                  "required": ["category", "summary"]}
+        p = (triage_intro(s) + f"These {len(new_msgs)} message(s) from {day} reply to an older "
+             "conversation whose earlier messages are not available. Give the category and a 1-2 "
+             "sentence summary of what they say.\n\n" + fit(new_msgs, NEW_BUDGET))
+    return ollama(s.model, p, schema)
 
 
 # ---------- IMAP fetch ----------
-def parse_internaldate(info):
-    m = IDATE.search(info)
+def parse_internaldate(meta):
+    m = IDATE.search(meta)
     if not m:
         return None
     try:
@@ -262,46 +389,74 @@ def parse_internaldate(info):
         return None
 
 
-def refs_of(hmsg):
+def iter_fetch(data):
+    """Yield (metadata, payload) per message. Metadata includes items the server sent
+    after the literal (e.g. a trailing UID)."""
+    for i, item in enumerate(data):
+        if isinstance(item, tuple):
+            meta = item[0]
+            if i + 1 < len(data) and isinstance(data[i + 1], bytes):
+                meta += b" " + data[i + 1]
+            yield meta, item[1]
+
+
+def refs_of(h):
     ids, seen = [], set()
-    for h in ("References", "In-Reply-To"):
-        v = hmsg.get(h)
-        if v:
-            for i in MIDRE.findall(v):
-                if i not in seen:
-                    seen.add(i)
-                    ids.append(i)
+    for name in ("References", "In-Reply-To"):
+        for i in MIDRE.findall(h.get(name) or ""):
+            if i not in seen:
+                seen.add(i)
+                ids.append(i)
     return ids
 
 
-def fetch_headers(M, folder, since_s, before_s):
+def is_spam(h):
+    if str(h.get("X-Spam-Flag", "")).strip().lower() == "yes":
+        return True
+    return any(str(h.get(k, "")).strip().lower().startswith("yes") for k in ("X-Spam-Status", "X-Spam-Report"))
+
+
+def is_auto(h):
+    auto = str(h.get("Auto-Submitted", "")).strip().lower()
+    prec = str(h.get("Precedence", "")).strip().lower()
+    return (auto not in ("", "no")) or prec in ("bulk", "junk", "auto_reply")
+
+
+def make_record(folder, meta, payload, me):
+    h = email.message_from_bytes(payload)
+    um = UIDRE.search(meta)
+    irt = MIDRE.findall(h.get("In-Reply-To") or "")
+    frm = h.get("From") or ""
+    return {
+        "mid": (h.get("Message-ID") or "").strip(),
+        "folder": folder, "uid": um.group(1) if um else None,
+        "from": dstr(frm),
+        "subject": dstr(h.get("Subject")) or "(no subject)",
+        "date": parse_internaldate(meta),
+        "refs": refs_of(h),
+        "irt": irt[0] if irt else None,
+        "from_me": parseaddr(str(frm))[1].lower() in me,
+        "to_me": bool(me & set(addrs(h.get_all("To", [])))),
+        "cc_me": bool(me & set(addrs(h.get_all("Cc", [])))),
+        "list": dstr(h.get("List-Id")),
+        "auto": is_auto(h),
+        "spam": is_spam(h),
+        "body": None,
+    }
+
+
+def fetch_headers(M, folder, since_s, before_s, me):
     typ, _ = M.select(f'"{folder}"', readonly=True)
     if typ != "OK":
-        print(f"!! cannot open folder {folder}", file=sys.stderr)
+        log(f"!! cannot open folder {folder}")
         return []
     typ, data = M.uid("SEARCH", None, "SINCE", since_s, "BEFORE", before_s)
     uids = data[0].split() if data and data[0] else []
     if not uids:
         return []
     typ, data = M.uid("FETCH", b",".join(uids),
-        "(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS (MESSAGE-ID IN-REPLY-TO REFERENCES SUBJECT FROM)])")
-    recs = []
-    for item in data:
-        if not isinstance(item, tuple):
-            continue
-        info, payload = item
-        um = UIDRE.search(info)
-        h = email.message_from_bytes(payload)
-        recs.append({
-            "mid": (h.get("Message-ID") or "").strip(),
-            "folder": folder, "uid": um.group(1) if um else None,
-            "from": dstr(h.get("From")),
-            "subject": dstr(h.get("Subject")) or "(no subject)",
-            "date": parse_internaldate(info),
-            "refs": refs_of(h),
-            "body": None,
-        })
-    return recs
+                      f"(UID INTERNALDATE BODY.PEEK[HEADER.FIELDS ({HDR_FIELDS})])")
+    return [make_record(folder, meta, payload, me) for meta, payload in iter_fetch(data)]
 
 
 def fetch_bodies(M, need):
@@ -311,14 +466,10 @@ def fetch_bodies(M, need):
         if typ != "OK":
             continue
         typ, data = M.uid("FETCH", b",".join(sorted(uids)), "(UID BODY.PEEK[])")
-        for item in data:
-            if not isinstance(item, tuple):
-                continue
-            info, payload = item
-            um = UIDRE.search(info)
-            if not um:
-                continue
-            bodies[(folder, um.group(1))] = clean_body(email.message_from_bytes(payload))
+        for meta, payload in iter_fetch(data):
+            um = UIDRE.search(meta)
+            if um:
+                bodies[(folder, um.group(1))] = clean_body(email.message_from_bytes(payload))
     return bodies
 
 
@@ -344,12 +495,9 @@ class UF:
 
 def build_threads(recs):
     # dedup by Message-ID (same message filed in multiple folders)
-    dedup, i = {}, 0
-    for r in recs:
-        key = r["mid"] or f"__nomid_{i}"
-        if key not in dedup:
-            dedup[key] = r
-        i += 1
+    dedup = {}
+    for i, r in enumerate(recs):
+        dedup.setdefault(r["mid"] or f"__nomid_{i}", r)
     records = list(dedup.values())
     mids_present = {r["mid"] for r in records if r["mid"]}
 
@@ -367,115 +515,52 @@ def build_threads(recs):
     return list(groups.values()), mids_present
 
 
-# ---------- main ----------
-def main():
-    global MODEL, THREAD_LOOKBACK
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--list-folders", action="store_true")
-    ap.add_argument("--folders", default=None, help="comma-separated; overrides config")
-    ap.add_argument("--day", default="yesterday", help="'yesterday' or YYYY-MM-DD")
-    ap.add_argument("--send", action="store_true", help="email the digest instead of printing")
-    a = ap.parse_args()
+def is_ongoing(prior, new_msgs, mids_present):
+    # References can hold synthetic IDs (GitLab), so only a missing direct parent counts.
+    return bool(prior) or any(r["irt"] and r["irt"] not in mids_present for r in new_msgs)
 
-    cfg = load_config()
-    if cfg.get("model"):
-        MODEL = cfg["model"]
-    THREAD_LOOKBACK = int(cfg.get("thread_lookback_days", THREAD_LOOKBACK))
-    if a.folders is not None:
-        folders = [f.strip() for f in a.folders.split(",") if f.strip()]
-    else:
-        folders = cfg.get("folders") or ["INBOX"]
 
-    M = connect()
+def local_day(r):
+    return r["date"].astimezone().date() if r["date"] else None
+
+
+# ---------- digest ----------
+def collect(s, anchor):
+    """Fetch headers and needed bodies for one digest day. Returns (plans, spam_skipped)."""
+    since = anchor - timedelta(days=s.lookback - 1)
+    before = anchor + timedelta(days=2)      # server dates may differ from local; filter below
+    since_s, before_s = since.strftime("%d-%b-%Y"), before.strftime("%d-%b-%Y")
+    M = connect(s)
     try:
-        if a.list_folders:
-            typ, data = M.list()
-            for raw in data:
-                line = raw.decode(errors="replace")
-                m = re.match(r'\([^)]*\)\s+"?[^"]*"?\s+(.+)$', line)
-                print((m.group(1).strip().strip('"') if m else line))
-            return
-
-        now = datetime.now().astimezone()
-        localtz = now.tzinfo
-        anchor = (now - timedelta(days=1)).date() if a.day == "yesterday" \
-            else datetime.strptime(a.day, "%Y-%m-%d").date()
-        before = datetime(anchor.year, anchor.month, anchor.day) + timedelta(days=1)
-        since = before - timedelta(days=THREAD_LOOKBACK)
-        since_s, before_s = since.strftime("%d-%b-%Y"), before.strftime("%d-%b-%Y")
-        day_label = anchor.strftime("%A %Y-%m-%d")
-
-        def is_new(r):
-            return r["date"] is not None and r["date"].astimezone(localtz).date() == anchor
-
         recs = []
-        for folder in folders:
-            got = fetch_headers(M, folder, since_s, before_s)
+        for folder in s.folders:
+            got = fetch_headers(M, folder, since_s, before_s, s.me)
             recs += got
-            print(f"  · scanned {folder}: {len(got)} msgs (60d)", file=sys.stderr)
+            log(f"scanned {folder}: {len(got)} msgs ({s.lookback}d)")
+        recs = [r for r in recs if local_day(r) is None or local_day(r) <= anchor]
+        spam = sum(1 for r in recs if r["spam"] and local_day(r) == anchor)
+        recs = [r for r in recs if not r["spam"]]
 
         threads, mids_present = build_threads(recs)
-        active = [t for t in threads if any(is_new(r) for r in t)]
-        print(f"  · {len(active)} active thread(s) with new mail on {day_label}", file=sys.stderr)
-
-        # decide bodies to fetch: all new msgs + (capped) prior for existing threads
-        need = {}
-        plans = []
-        for t in active:
-            new_msgs = sorted([r for r in t if is_new(r)], key=lambda r: r["date"])
-            prior = sorted([r for r in t if not is_new(r)], key=lambda r: r["date"])
-            missing_parent = any(ref not in mids_present for r in new_msgs for ref in r["refs"])
-            existing = bool(prior) or missing_parent
-            fetch_set = list(new_msgs)
-            if existing and prior:
-                fetch_set += prior[-RECAP_PRIOR_MAX:]
-            for r in fetch_set:
+        plans, need = [], {}
+        for t in threads:
+            new_msgs = sorted([r for r in t if local_day(r) == anchor], key=lambda r: r["date"])
+            if not any(not r["from_me"] for r in new_msgs):
+                continue
+            prior = sorted([r for r in t if local_day(r) != anchor and r["date"]],
+                           key=lambda r: r["date"])[-RECAP_PRIOR_MAX:]
+            ongoing = is_ongoing(prior, new_msgs, mids_present)
+            for r in new_msgs + prior:
                 if r["uid"]:
                     need.setdefault(r["folder"], set()).add(r["uid"])
-            plans.append((t, new_msgs, prior, existing))
+            plans.append((t, new_msgs, prior, ongoing))
+        log(f"{len(plans)} active thread(s) on {anchor}")
 
         bodies = fetch_bodies(M, need)
-        for t in active:
+        for t, _, _, _ in plans:
             for r in t:
                 r["body"] = bodies.get((r["folder"], r["uid"]), "")
-
-        results = []
-        for t, new_msgs, prior, existing in plans:
-            subject = clean_subject(sorted(t, key=lambda r: r["date"] or now)[0]["subject"])
-            names, seen = [], set()
-            for r in sorted(t, key=lambda r: r["date"] or now):
-                nm = display_name(r["from"])
-                if nm not in seen:
-                    seen.add(nm)
-                    names.append(nm)
-            participants = ", ".join(names[:4]) + (" …" if len(names) > 4 else "")
-            latest = max((r["date"] for r in new_msgs if r["date"]), default=now)
-            print(f"  · summarizing: {subject[:55]}", file=sys.stderr)
-
-            if not existing:
-                cat, summary = summ_new_thread(new_msgs)
-                results.append({"cat": cat, "kind": "new", "subject": subject,
-                                "participants": participants, "summary": summary,
-                                "recap": None, "adds": [], "latest": latest})
-            else:
-                recap = recap_prior(prior[-RECAP_PRIOR_MAX:]) if prior else None
-                adds, cats = [], []
-                for m in new_msgs:
-                    c, txt = summ_added(recap, m)
-                    adds.append((display_name(m["from"]), txt))
-                    cats.append(c)
-                cat = max(cats, key=lambda c: PRIORITY[c]) if cats else "FYI"
-                results.append({"cat": cat, "kind": "existing", "subject": subject,
-                                "participants": participants, "summary": None,
-                                "recap": recap, "adds": adds, "latest": latest})
-
-        text = format_digest(results, day_label)
-        subject = f"Work digest — {day_label}  ({len(results)} threads)"
-        if a.send:
-            send_email(cfg, subject, text)
-            print(f"sent '{subject}' to {cfg.get('delivery', {}).get('mail_to')}", file=sys.stderr)
-        else:
-            print(text)
+        return plans, spam
     finally:
         try:
             M.logout()
@@ -483,31 +568,174 @@ def main():
             pass
 
 
-def format_digest(threads, day):
-    if not threads:
-        return f"# Work email digest — {day}\n\n(no mail found in the selected folders)"
-    groups = [("ACTION", "## Needs action / reply"),
-              ("FYI", "## FYI"),
-              ("AUTO", "## Automated / low priority")]
-    out = [f"# Work email digest — {day}  ({len(threads)} threads)", ""]
-    for cat, header in groups:
-        g = sorted([t for t in threads if t["cat"] == cat], key=lambda t: t["latest"], reverse=True)
+def digest_day(s, anchor, notes=()):
+    plans, spam = collect(s, anchor)
+    day = anchor.isoformat()
+    results = []
+    for t, new_msgs, prior, ongoing in plans:
+        ordered = sorted(t, key=lambda r: r["date"] or datetime.max.astimezone())
+        subject = clean_subject(ordered[0]["subject"])
+        names = []
+        for r in ordered:
+            nm = "you" if r["from_me"] else display_name(r["from"])
+            if nm not in names:
+                names.append(nm)
+        log(f"summarizing: {subject[:60]}")
+        try:
+            out = summarize_thread(s, day, new_msgs, prior, ongoing)
+        except Exception as e:           # one bad thread must not sink the digest
+            log(f"summary failed for {subject[:60]}: {e}")
+            out = {"category": "FYI", "summary": f"(summary unavailable: {e})"}
+        results.append({
+            "cat": out["category"], "subject": subject, "ongoing": ongoing,
+            "recap": out.get("recap") if prior else None,
+            "summary": out.get("summary") or "(no summary)",
+            "participants": ", ".join(names[:4]) + (" …" if len(names) > 4 else ""),
+            "folders": ", ".join(sorted({r["folder"] for r in new_msgs})),
+            "n_new": len(new_msgs), "sender": display_name(new_msgs[0]["from"]),
+            "latest": max(r["date"] for r in new_msgs),
+        })
+    label = anchor.strftime("%A %Y-%m-%d")
+    n_action = sum(r["cat"] == "ACTION" for r in results)
+    subject = f"Work digest — {label} ({len(results)} threads" + \
+              (f", {n_action} need action)" if n_action else ")")
+    return subject, format_digest(results, label, spam, notes)
+
+
+GROUPS = [("ACTION", "Needs action / reply", "need action"),
+          ("FYI", "FYI", "FYI"),
+          ("AUTO", "Automated / low priority", "automated"),
+          ("JUNK", "Probably junk", "probably junk")]
+
+
+def format_digest(results, day, spam_skipped=0, notes=()):
+    out = [f"# Work email digest — {day}", ""]
+    out += [f"*{n}*" for n in notes]
+    if not results:
+        out.append("No new mail in the selected folders.")
+    else:
+        counts = [f"{sum(r['cat'] == c for r in results)} {short}" for c, _, short in GROUPS
+                  if any(r["cat"] == c for r in results)]
+        out += ["**" + " · ".join(counts) + "**", ""]
+    for cat, header, _ in GROUPS:
+        g = sorted([r for r in results if r["cat"] == cat], key=lambda r: r["latest"], reverse=True)
         if not g:
             continue
-        out.append(f"{header}  ({len(g)})")
-        out.append("")
-        for t in g:
-            out.append(f"### {t['subject']}")
-            out.append(f"*{t['participants']}*")
-            if t["kind"] == "new":
-                out.append(f"🆕 {t['summary']}")
-            else:
-                out.append(f"↳ _Recap:_ {t['recap']}" if t["recap"]
-                           else "↳ _Continuation of an earlier thread (prior messages outside the 60-day window)._")
-                for who, txt in t["adds"]:
-                    out.append(f"- **{who}**: {txt}")
+        out += [f"## {header} ({len(g)})", ""]
+        if cat == "JUNK":
+            out += [f"- {r['subject']} — {r['sender']}" for r in g]
             out.append("")
-    return "\n".join(out)
+            continue
+        for r in g:
+            meta = [r["participants"], r["folders"]]
+            if r["ongoing"]:
+                meta.append(f"{r['n_new']} new")
+            elif r["n_new"] > 1:
+                meta.append(f"{r['n_new']} messages")
+            out += [f"### {r['subject']}", "*" + " · ".join(meta) + "*"]
+            if not r["ongoing"]:
+                out.append(f"🆕 {r['summary']}")
+            else:
+                out.append(f"↳ *Earlier:* {r['recap']}" if r["recap"]
+                           else "↳ *Reply to an earlier conversation (not in the scanned folders).*")
+                out.append(f"**New:** {r['summary']}")
+            out.append("")
+    if spam_skipped:
+        out.append(f"*{spam_skipped} message(s) flagged as spam by the server were skipped.*")
+    return "\n".join(out).rstrip() + "\n"
+
+
+# ---------- catch-up state ----------
+def read_state():
+    try:
+        return date.fromisoformat(_read(STATE_FILE))
+    except (OSError, ValueError):
+        return None
+
+
+def write_state(d):
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(d.isoformat() + "\n")
+    os.replace(tmp, STATE_FILE)
+
+
+def days_to_send(last, yesterday, cap=CATCHUP_MAX_DAYS):
+    """Days after `last` up to `yesterday`, at most `cap` of them. Returns (days, skipped)."""
+    start = last + timedelta(days=1) if last else yesterday
+    first_allowed = yesterday - timedelta(days=cap - 1)
+    skipped = max(0, (first_allowed - start).days)
+    start = max(start, first_allowed)
+    return [start + timedelta(days=i) for i in range((yesterday - start).days + 1)], skipped
+
+
+# ---------- main ----------
+def list_folders(s):
+    M = connect(s)
+    try:
+        typ, data = M.list()
+        for raw in data:
+            line = raw.decode(errors="replace")
+            m = re.match(r'\([^)]*\)\s+"?[^"]*"?\s+(.+)$', line)
+            print(m.group(1).strip().strip('"') if m else line)
+    finally:
+        M.logout()
+
+
+def run(a, s):
+    if a.list_folders:
+        return list_folders(s)
+    yesterday = date.today() - timedelta(days=1)
+    if a.catch_up:
+        last = read_state()
+        days, skipped = days_to_send(last, yesterday)
+        if not days:
+            log(f"nothing to do (last digest sent for {last})")
+            return
+    else:
+        days = [yesterday if a.day == "yesterday" else date.fromisoformat(a.day)]
+        skipped = 0
+    for i, d in enumerate(days):
+        notes = []
+        if i == 0 and skipped:
+            notes.append(f"{skipped} earlier day(s) were not digested "
+                         f"(catch-up covers at most {CATCHUP_MAX_DAYS} days).")
+        subject, text = digest_day(s, d, notes)
+        if a.send:
+            send_email(s, subject, text)
+            log(f"sent '{subject}' to {s.delivery.get('mail_to')}")
+            if (read_state() or date.min) < d:
+                write_state(d)
+        else:
+            print(text)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Summarize a day's work email with a local LLM.")
+    ap.add_argument("--list-folders", action="store_true")
+    ap.add_argument("--folders", default=None, help="comma-separated; overrides config")
+    ap.add_argument("--day", default="yesterday", help="'yesterday' or YYYY-MM-DD")
+    ap.add_argument("--catch-up", action="store_true",
+                    help=f"digest every day since the last one sent (max {CATCHUP_MAX_DAYS})")
+    ap.add_argument("--send", action="store_true", help="email the digest instead of printing")
+    a = ap.parse_args()
+
+    s = Settings(load_config())
+    if a.folders is not None:
+        s.folders = [f.strip() for f in a.folders.split(",") if f.strip()]
+    try:
+        run(a, s)
+    except DeliveryError:
+        raise
+    except Exception:
+        if a.send:
+            try:
+                send_email(s, "Work digest FAILED",
+                           "The work email digest failed:\n\n" + traceback.format_exc())
+            except Exception as e:
+                log(f"could not send failure notice: {e}")
+        raise
 
 
 if __name__ == "__main__":

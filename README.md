@@ -6,7 +6,12 @@ touched), grouped into threads, summarized, and emailed to you each morning.
 
 - New thread (started on the digest day): one summary of the whole thread.
 - Ongoing thread: a short recap of earlier messages plus what the new messages add.
-- Threads are grouped as **Needs action**, **FYI** and **Automated**.
+- One summary per thread covers all of the day's new messages.
+- Threads are grouped as **Needs action**, **FYI**, **Automated** and **Probably junk**
+  (listed compactly). Mail the server flagged as spam is skipped.
+- The model is told who you are and whether each message was sent to you directly,
+  as Cc, through a mailing list or by an automated sender.
+- Missed days (machine off at 07:00) are caught up on the next run, up to 7 days.
 
 Mail content only goes to the local Ollama instance.
 
@@ -57,6 +62,23 @@ mail_digest.py --list-folders          # show IMAP folder names
 mail_digest.py --day yesterday         # print digest to stdout
 mail_digest.py --day 2026-09-22        # a specific day
 mail_digest.py --day yesterday --send  # email it
+mail_digest.py --catch-up --send       # email every day since the last one sent (what the timer runs)
+```
+
+The last day sent is recorded in `~/.local/state/mail-digest/last-sent`. If a run
+fails before sending, it tries to email you a short failure notice, unless SMTP
+itself is what failed.
+
+## Configuration
+
+See [`config.example.toml`](config.example.toml): `folders`, `[account]` (IMAP
+host and user), `[identity]` (name, role and addresses, used to spot mail addressed
+to you) and `[delivery]` (SMTP settings and recipient).
+
+## Tests
+
+```sh
+python3 -m unittest discover -s tests
 ```
 
 Logs: `journalctl --user -u mail-digest`. Run now: `systemctl --user start mail-digest.service`.

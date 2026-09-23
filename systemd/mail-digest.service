@@ -5,7 +5,7 @@ Wants=ollama.service
 
 [Service]
 Type=oneshot
-# Reads folders/delivery from ~/.config/mail-digest/config.toml.
+# Digests every day since the last one sent (max 7). Reads folders/delivery from ~/.config/mail-digest/config.toml.
 # Decrypts imap-password.cred / smtp-password.cred via systemd-creds --user.
-ExecStart=%h/.local/bin/mail_digest.py --day yesterday --send
-TimeoutStartSec=600
+ExecStart=%h/.local/bin/mail_digest.py --catch-up --send
+TimeoutStartSec=3600
